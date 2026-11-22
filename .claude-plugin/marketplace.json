@@ -1,0 +1,17 @@
+{
+  "name": "doc-ocr",
+  "owner": {
+    "name": "fplusf"
+  },
+  "plugins": [
+    {
+      "name": "doc-ocr",
+      "source": "./",
+      "description": "OCR any document into clean text and export it to Word and other formats.",
+      "version": "1.0.0"
+    }
+  ],
+  "metadata": {
+    "description": "doc-ocr: OCR any document into clean, editable text and export it to Word and other formats."
+  }
+}
