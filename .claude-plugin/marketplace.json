@@ -8,7 +8,7 @@
       "name": "doc-ocr",
       "source": "./",
       "description": "OCR any document into clean text and export it to Word and other formats.",
-      "version": "1.0.0"
+      "version": "1.1.0"
     }
   ],
   "metadata": {

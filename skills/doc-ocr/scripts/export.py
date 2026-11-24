@@ -250,7 +250,7 @@ def to_txt(blocks, title) -> str:
     for b in blocks:
         t = b["t"]
         if t == "h":
-            out += [plain(b["text"]).upper() if b["level"] <= 2 else plain(b["text"]), ""]
+            out += [plain(b["text"]), ""]          # keep the original case
         elif t in ("p", "quote", "code"):
             out += [plain(b["text"]) if t != "code" else b["text"], ""]
         elif t in ("ul", "ol"):

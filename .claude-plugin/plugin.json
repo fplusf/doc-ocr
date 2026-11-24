@@ -1,6 +1,6 @@
 {
   "name": "doc-ocr",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "OCR any document (scanned PDFs, photos, screenshots, Office files) into clean text and export it to Word, ODT, RTF, HTML, Markdown or TXT.",
   "author": { "name": "fplusf" },
   "homepage": "https://github.com/fplusf/doc-ocr",

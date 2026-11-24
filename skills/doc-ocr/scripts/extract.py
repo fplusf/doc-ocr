@@ -55,8 +55,15 @@ LANGS = {
 }
 
 # Review thresholds: a page under these is flagged for a visual check by Claude.
-VISION_MIN_CONF = 0.80
+# Clean Russian scans from Vision score about 0.78, so 0.80 flagged them for nothing;
+# pages with tables or real misreads are still caught by the table flag.
+VISION_MIN_CONF = 0.75
 TESS_MIN_CONF = 0.75
+
+CYRILLIC_LANGS = ("ru", "tg", "uk", "kk", "ky", "uz")
+# OCR misreads of the number sign "№" (tgk reads it as "Хе", others as "Ne", "N2", "N°", "No").
+# Only replaced when a number follows, so real words are left alone.
+NUMERO_RE = re.compile(r"(?<!\w)(?:[NН][º°oо2eе]|[ХX][еe])\.?\s?(?=\d)")
 
 
 def log(msg: str) -> None:
@@ -153,17 +160,45 @@ class Engines:
             return "", None
         conf = statistics.fmean(float(w[10]) for w in words) / 100.0
         page_w = next((float(r[8]) for r in rows if len(r) == 12 and r[0] == "1"), 1.0) or 1.0
-        paras: dict[tuple, dict[int, list]] = {}
+        lines: dict[tuple, list] = {}              # (block, paragraph, line) -> words, in reading order
         for w in words:
-            pkey = (int(w[2]), int(w[3]))          # block, paragraph
-            lkey = int(w[4])                       # line
             left, width = float(w[6]), float(w[8])
-            paras.setdefault(pkey, {}).setdefault(lkey, []).append((w[11], left, left + width))
-        out = []
-        for _, lines in paras.items():
-            txt = [" ".join(t for t, _, _ in ws) for ws in lines.values()]
-            widths = [(max(r for _, _, r in ws) - min(l for _, l, _ in ws)) / page_w for ws in lines.values()]
-            out.append("\n".join(txt) if keep_lines else join_paragraph(txt, widths))
+            lines.setdefault((int(w[2]), int(w[3]), int(w[4])), []).append((w[11], left, left + width))
+        keys = list(lines)
+        cells = []
+        for k in keys:                             # a wide gap between words starts a new table cell
+            ws, cur = lines[k], [lines[k][0][0]]
+            for prev, w in zip(ws, ws[1:]):
+                if w[1] - prev[2] > 0.05 * page_w:
+                    cur.append(w[0])
+                else:
+                    cur[-1] += " " + w[0]
+            cells.append(cur)
+        out, buf, cur_para = [], [], None
+
+        def flush():
+            if buf:
+                txt = [" ".join(t for t, _, _ in lines[k]) for k in buf]
+                widths = [(lines[k][-1][2] - lines[k][0][1]) / page_w for k in buf]
+                out.append("\n".join(txt) if keep_lines else join_paragraph(txt, widths))
+                buf.clear()
+
+        i = 0
+        while i < len(keys):                       # same rule as Vision: 3+ rows with equal 2+ cell count
+            n, j = len(cells[i]), i
+            while j < len(keys) and n >= 2 and len(cells[j]) == n:
+                j += 1
+            if j - i >= 3:
+                flush()
+                out.append(md_table(cells[i:j]))
+                cur_para, i = None, j
+                continue
+            if keys[i][:2] != cur_para:
+                flush()
+                cur_para = keys[i][:2]
+            buf.append(keys[i])
+            i += 1
+        flush()
         return "\n\n".join(out), conf
 
 
@@ -317,6 +352,13 @@ def image_size(path: Path) -> tuple[int, int]:
 
 # --------------------------------------------------------------------------- per-format readers
 
+def fix_soft_hyphens(text: str) -> str:
+    """U+00AD at a line end before a lowercase continuation joins the word; elsewhere it becomes "-"."""
+    text = re.sub(r"­[ \t]*\n[ \t]*(?=[^\W\d_])",
+                  lambda m: "" if text[m.end()].islower() else m.group(0), text)
+    return text.replace("­", "-")
+
+
 def looks_garbled(text: str) -> bool:
     """A text layer can exist but be junk (bad font maps, OCR-less scans with fake text)."""
     t = re.sub(r"\s", "", text)
@@ -347,6 +389,8 @@ class Job:
                  image: Path | None, flag_reason: str | None = None):
         self.page_no += 1
         n = self.page_no
+        if method == "native":
+            text = fix_soft_hyphens(text)
         needs = flag_reason is not None
         if conf is not None:
             limit = VISION_MIN_CONF if method == "vision" else TESS_MIN_CONF
@@ -378,8 +422,8 @@ class Job:
         except Exception as e:  # noqa: BLE001
             log(f"  OCR failed on {source} {label}: {e}")
             text, conf, method = "", None, "claude"
-        if any(l in ("ru", "tg", "uk", "kk", "ky", "uz") for l in self.langs):
-            text = re.sub(r"\bN[º°o]\s?(?=\d)", "№ ", text)       # Cyrillic number sign
+        if any(l in CYRILLIC_LANGS for l in self.langs):
+            text = NUMERO_RE.sub("№ ", text)                      # Cyrillic number sign
         reason = "low-resolution source image: check every word and number" if low_res else None
         self.add_page(source, label, text, method, conf, png, reason)
 
@@ -396,8 +440,9 @@ class Job:
             native_ok = len(text.strip()) >= 40 and not looks_garbled(text)
             if self.args.engine == "native" or (native_ok and not self.args.force_ocr):
                 blocks = page.get_text("blocks", sort=True)
-                paras = [join_paragraph([l for l in b[4].splitlines() if l.strip()]) if not self.args.keep_lines
-                         else b[4].strip() for b in blocks if b[6] == 0 and b[4].strip()]
+                paras = [join_paragraph([l for l in fix_soft_hyphens(b[4]).splitlines() if l.strip()])
+                         if not self.args.keep_lines else fix_soft_hyphens(b[4]).strip()
+                         for b in blocks if b[6] == 0 and b[4].strip()]
                 body = "\n\n".join(paras)
                 png = None
                 if self.args.save_pages:
@@ -499,14 +544,65 @@ class Job:
             self._ocr_zip_media(path, "ppt/media/")
 
     def do_odf(self, path: Path):
+        import xml.etree.ElementTree as ET
+        T = "{urn:oasis:names:tc:opendocument:xmlns:text:1.0}"
+        TB = "{urn:oasis:names:tc:opendocument:xmlns:table:1.0}"
+        S = "{urn:oasis:names:tc:opendocument:xmlns:style:1.0}"
         with zipfile.ZipFile(path) as z:
-            xml = z.read("content.xml").decode("utf8", "ignore")
+            root = ET.fromstring(z.read("content.xml"))
+            xmls = [root] + ([ET.fromstring(z.read("styles.xml"))] if "styles.xml" in z.namelist() else [])
+        styles = {s.get(S + "name"): s for x in xmls for s in x.iter(S + "style")}
+
+        def heading_level(name, depth=0):
+            """Level when a paragraph style is (or inherits from) a heading style, else None."""
+            s = styles.get(name)
+            lvl = s.get(S + "default-outline-level") if s is not None else None
+            if lvl:
+                return int(lvl)
+            if name and "heading" in name.lower():
+                m = re.search(r"(\d)\s*$", name)
+                return int(m.group(1)) if m else 2
+            parent = s.get(S + "parent-style-name") if s is not None else None
+            return heading_level(parent, depth + 1) if parent and depth < 5 else None
+
+        def text_of(el):
+            out = [el.text or ""]
+            for c in el:
+                if c.tag == T + "s":
+                    out.append(" " * int(c.get(T + "c", "1")))
+                elif c.tag == T + "tab":
+                    out.append(" ")
+                elif c.tag == T + "line-break":
+                    out.append("\n")
+                elif c.tag not in (T + "note", T + "tracked-changes"):
+                    out.append(text_of(c))
+                out.append(c.tail or "")
+            return "".join(out)
+
         paras = []
-        for m in re.finditer(r"<text:(h|p)[^>]*>(.*?)</text:\1>", xml, re.S):
-            t = html.unescape(re.sub(r"<[^>]+>", "", m.group(2))).strip()
-            if t:
-                paras.append(("## " if m.group(1) == "h" else "") + t)
-        self.add_page(path.name, "document", "\n\n".join(paras), "native", None, None)
+
+        def walk(el, prefix=""):
+            for c in el:
+                if c.tag in (T + "h", T + "p"):
+                    t = text_of(c).strip()
+                    if not t:
+                        continue
+                    lvl = c.get(T + "outline-level") or heading_level(c.get(T + "style-name"))
+                    if c.tag == T + "h" and not lvl:
+                        lvl = 2
+                    paras.append(("#" * min(int(lvl), 6) + " " if lvl else prefix) + t)
+                elif c.tag == TB + "table":
+                    rows = [[text_of(cell).strip() for cell in r.iter(TB + "table-cell")]
+                            for r in c.iter(TB + "table-row")]
+                    paras.append(md_table([r for r in rows if any(r)]))
+                elif c.tag == T + "list-item":
+                    walk(c, "- ")
+                elif c.tag not in (T + "tracked-changes", T + "sequence-decls"):
+                    walk(c, prefix)
+
+        for body in root.iter("{urn:oasis:names:tc:opendocument:xmlns:office:1.0}body"):
+            walk(body)
+        self.add_page(path.name, "document", "\n\n".join(p for p in paras if p), "native", None, None)
 
     def do_html(self, path: Path, raw: str | None = None):
         from bs4 import BeautifulSoup
@@ -514,7 +610,16 @@ class Job:
         for t in soup(["script", "style", "nav", "noscript"]):
             t.decompose()
         out = []
-        for el in soup.find_all(["h1", "h2", "h3", "h4", "p", "li", "pre", "blockquote", "td"]):
+        for el in soup.find_all(["h1", "h2", "h3", "h4", "p", "li", "pre", "blockquote", "table"]):
+            if el.find_parent("table") is not None:
+                continue                            # already written as part of its table
+            if el.name == "table":
+                rows = [[c.get_text(" ", strip=True) for c in tr.find_all(["td", "th"])]
+                        for tr in el.find_all("tr")]
+                rows = [r for r in rows if any(r)]
+                if rows:
+                    out.append(md_table(rows))
+                continue
             t = el.get_text(" ", strip=True)
             if not t or el.find_parent(["li", "p"]) is not None and el.name != "li":
                 continue
@@ -529,19 +634,25 @@ class Job:
 
     def do_epub(self, path: Path):
         with zipfile.ZipFile(path) as z:
-            names = sorted(n for n in z.namelist() if n.endswith((".xhtml", ".html", ".htm")))
+            names = epub_spine(z) or sorted(n for n in z.namelist() if n.endswith((".xhtml", ".html", ".htm")))
             for n in names:
                 text = self.do_html(path, z.read(n).decode("utf8", "ignore"))
                 if text.strip():
                     self.add_page(path.name, Path(n).name, text, "native", None, None)
 
     def do_rtf(self, path: Path):
-        raw = path.read_text("latin-1", "ignore")
-        raw = re.sub(r"\\'([0-9a-f]{2})", lambda m: bytes([int(m.group(1), 16)]).decode("cp1251", "ignore"), raw)
-        raw = re.sub(r"\\u(-?\d+)\??", lambda m: chr(int(m.group(1)) % 65536), raw)
-        raw = re.sub(r"\\par[d]?\b", "\n", raw)
-        raw = re.sub(r"\{\\\*[^{}]*\}|\\[a-z]+-?\d* ?|[{}]", "", raw)
-        self.add_page(path.name, "document", re.sub(r"\n{3,}", "\n\n", raw).strip(), "native", None, None)
+        text = rtf_to_text(path.read_text("latin-1", "ignore"))
+        out, rows = [], []
+        for line in text.split("\n") + [""]:
+            if "\t" in line:                        # table row: cells end with \cell (tab)
+                rows.append([c.strip() for c in line.rstrip("\t").split("\t")])
+                continue
+            if rows:
+                out.append(md_table(rows))
+                rows = []
+            if line.strip():
+                out.append(re.sub(r"[ \t]+", " ", line).strip())
+        self.add_page(path.name, "document", "\n\n".join(out), "native", None, None)
 
     def run(self, inputs: list[Path]):
         files: list[Path] = []
@@ -594,6 +705,95 @@ class Job:
         print(json.dumps({"text": str(self.out / "text.md"), "report": str(self.out / "report.json"),
                           "engine": self.ocr_engine, **s, "warnings": self.report["warnings"],
                           "errors": self.report.get("errors", [])}, ensure_ascii=False, indent=2))
+
+
+def epub_spine(z: zipfile.ZipFile) -> list[str]:
+    """Chapter files in reading order: container.xml -> OPF -> manifest + spine. [] if unreadable."""
+    import posixpath
+    import xml.etree.ElementTree as ET
+    from urllib.parse import unquote
+    try:
+        cont = ET.fromstring(z.read("META-INF/container.xml"))
+        opf_path = next(e.get("full-path") for e in cont.iter() if e.tag.endswith("rootfile"))
+        opf = ET.fromstring(z.read(opf_path))
+        base = posixpath.dirname(opf_path)
+        hrefs = {e.get("id"): e.get("href") for e in opf.iter() if e.tag.endswith("}item") or e.tag == "item"}
+        names = set(z.namelist())
+        order = []
+        for e in opf.iter():
+            if e.tag.endswith("itemref") and e.get("idref") in hrefs:
+                n = posixpath.normpath(posixpath.join(base, unquote(hrefs[e.get("idref")].split("#")[0])))
+                if n in names and n not in order:
+                    order.append(n)
+        return order
+    except Exception:  # noqa: BLE001
+        return []
+
+
+# RTF groups that hold no document text (font and colour tables, styles, metadata, pictures)
+RTF_SKIP = {"fonttbl", "colortbl", "stylesheet", "info", "pict", "header", "footer", "headerl", "headerr",
+            "footerl", "footerr", "listtable", "listoverridetable", "rsidtbl", "generator", "xmlnstbl",
+            "themedata", "colorschememapping", "latentstyles", "datastore", "object", "fldinst"}
+RTF_SYMBOLS = {"par": "\n", "line": "\n", "sect": "\n", "page": "\n", "row": "\n", "cell": "\t",
+               "tab": " ", "bullet": "-", "emdash": "-", "endash": "-", "lquote": "'", "rquote": "'",
+               "ldblquote": "\"", "rdblquote": "\"", "emspace": " ", "enspace": " ", "qmspace": " "}
+
+
+def rtf_to_text(raw: str) -> str:
+    """Small RTF reader: text with \\n per paragraph and \\t after each table cell."""
+    m = re.search(r"\\ansicpg(\d+)", raw)
+    cp = f"cp{m.group(1)}" if m else "cp1252"
+    try:
+        b"a".decode(cp)
+    except LookupError:
+        cp = "cp1252"
+    out, stack = [], []
+    uc, skip, fresh, pending = 1, False, False, 0     # pending: fallback chars still to drop after \uN
+    tok = re.compile(r"\\([a-zA-Z]+)(-?\d+)? ?|\\'([0-9a-fA-F]{2})|\\([^a-zA-Z])|([{}])|([\r\n]+)|([^\\{}\r\n]+)")
+    for m in tok.finditer(raw):
+        word, num, hexb, sym, brace, newline, text = m.groups()
+        if newline:
+            continue                                  # raw line breaks mean nothing in RTF
+        was_fresh, fresh = fresh, False
+        if brace == "{":
+            stack.append((uc, skip))
+            fresh = True
+            continue
+        if brace == "}":
+            uc, skip = stack.pop() if stack else (1, False)
+            pending = 0
+            continue
+        if (sym == "*" or word in RTF_SKIP) and was_fresh:
+            skip = True
+            continue
+        if skip:
+            continue
+        if word:
+            if word == "u":
+                out.append(chr(int(num) % 65536))
+                pending = uc
+            elif word == "uc":
+                uc = int(num or 1)
+            elif word in RTF_SYMBOLS:
+                out.append(RTF_SYMBOLS[word])
+        elif hexb or sym:
+            if pending:
+                pending -= 1
+            elif hexb:
+                out.append(bytes([int(hexb, 16)]).decode(cp, "ignore"))
+            elif sym in "\\{}":
+                out.append(sym)
+            elif sym in "\r\n":
+                out.append("\n")                      # "\" + newline is a paragraph break
+            elif sym == "~":
+                out.append(" ")
+            elif sym == "_":
+                out.append("-")
+        elif text:
+            k = min(pending, len(text))
+            pending -= k
+            out.append(text[k:])
+    return "".join(out)
 
 
 def md_table(rows: list[list[str]]) -> str:
